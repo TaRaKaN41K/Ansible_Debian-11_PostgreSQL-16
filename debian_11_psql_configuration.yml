@@ -1,0 +1,314 @@
+---
+- name: Installing the required packages, сreating a new user and setting up a static address
+  hosts: debian_11_primary
+  become: true
+  vars_files:
+    - vars.yml
+  tasks:
+
+    - name: Update APT package index
+      apt:
+        update_cache: yes
+
+    - name: Installing the required packages
+      apt:
+        name: 
+          - sudo
+          - iptables
+          - iptables-persistent
+          - rsyslog
+          - curl
+          - ca-certificates
+          - python3-psycopg2
+        state: present
+
+    - name: Сreating a new user and assigning rights
+      block:
+        - name: Create New User '{{ admin_user }}'
+          user:
+            name: "{{ admin_user }}"
+            password: "{{ admin_password }}"
+            shell: /bin/bash
+            state: present
+
+        - name: Add '{{ admin_user }}' to Sudo Group
+          user:
+            name: "{{ admin_user }}"
+            groups: sudo
+            append: yes
+
+        - name: Configure Sudoers for Passwordless Access
+          lineinfile:
+            path: /etc/sudoers
+            state: present
+            line: "{{ admin_user }} ALL=(ALL:ALL) NOPASSWD:ALL"
+            validate: 'visudo -cf %s'
+
+    - name: Configure Network Interfaces
+      block:
+        - name: Configure /etc/network/interfaces
+          copy:
+            dest: /etc/network/interfaces
+            content: |
+              # Network interface configuration
+              source /etc/network/interfaces.d/*
+
+              auto lo
+              iface lo inet loopback
+
+              auto enp2s0
+              iface enp2s0 inet static
+                address {{ static_address }}/24
+                gateway {{ gateway }}
+                dns-nameservers {{ dns_servers | join(' ') }}
+
+        - name: Restart Networking Service
+          service:
+            name: networking
+            state: restarted
+          async: 10
+          poll: 0
+
+- name: Generate SSH Key on Local Machine (if it doesn't exist or regenerate)
+  hosts: localhost
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: Check if SSH Key exists
+      stat:
+        path: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+      register: ssh_key_status
+
+    - name: Remove existing SSH Key
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+        state: absent
+      when: ssh_key_status.stat.exists
+
+    - name: Remove existing SSH Public Key
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa.pub"
+        state: absent
+      when: ssh_key_status.stat.exists
+
+    - name: Generate SSH Key If Not Exists
+      openssh_keypair:
+        path: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+        type: rsa
+        size: 4096
+        passphrase: "{{ ssh_key_passphrase }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Copy Public Key to Remote Server
+      command: ssh-copy-id -i "{{ lookup('env', 'HOME') }}/.ssh/id_rsa.pub" "{{ admin_user }}@{{ static_address }}"
+      delegate_to: localhost
+
+
+- name: Configure server
+  hosts: debian_11_secondary
+  become: true
+  vars_files:
+    - vars.yml
+  tasks:
+
+    - name: Update APT Package Index
+      apt:
+        update_cache: yes
+
+    - name: Configure SSH Settings
+      block:
+        - name: Enable Password Authentication in SSH
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "^#?PasswordAuthentication"
+            line: "PasswordAuthentication yes"
+            state: present
+
+        - name: Ensure AuthorizedKeysFile is Un-commented
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "^#AuthorizedKeysFile"
+            line: "AuthorizedKeysFile .ssh/authorized_keys"
+            state: present
+
+        - name: Enable Public Key Authentication in SSH
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "^#?PubkeyAuthentication"
+            line: "PubkeyAuthentication yes"
+            state: present
+
+        - name: Ensure SSH allows both password and public key authentication
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "^#?AuthenticationMethods"
+            line: "AuthenticationMethods publickey,password"
+            state: present
+
+        - name: Disable Root Login via SSH
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "^#?PermitRootLogin"
+            line: "PermitRootLogin no"
+            state: present
+
+        - name: Set Custom SSH Port
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "^#?Port"
+            line: "Port {{ ssh_port }}"
+            state: present
+
+        - name: Limit SSH Listening to Specific Address
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "^#?ListenAddress"
+            line: "ListenAddress {{ ssh_listen_address }}"
+            state: present
+
+        - name: Allow Only '{{ admin_user }}' SSH Access
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "^#?AllowUsers"
+            line: "AllowUsers {{ admin_user }}"
+            state: present
+
+        - name: Restart SSH Service to Apply Changes
+          service:
+            name: ssh
+            state: restarted
+
+    - name: Configure Firewall
+      block:
+        - name: Flush existing iptables rules
+          command: iptables -F
+
+        - name: Allow established connections
+          command: iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+        - name: Allow SSH on Custom Port
+          command: iptables -A INPUT -p tcp --dport {{ ssh_port }} -j ACCEPT
+
+        - name: Configure iptables to allow PostgreSQL on new port
+          command: iptables -A INPUT -p tcp --dport {{ db_port }} -j ACCEPT
+
+        - name: Log all incoming packets
+          command: "iptables -A INPUT -j LOG --log-prefix 'IPTables-Input: ' --log-level 4"
+
+        - name: Set default policy to drop all incoming connections
+          command: iptables -P INPUT DROP
+
+        - name: Allow outgoing connections
+          command: iptables -P OUTPUT ACCEPT
+
+        - name: Save iptables rules
+          shell: iptables-save > /etc/iptables/rules.v4
+
+    - name: Configure rsyslog
+      block:
+      - name: Ensure /etc/rsyslog.d directory exists
+        file:
+          path: /etc/rsyslog.d
+          state: directory
+          mode: '0755'
+
+      - name: Ensure iptables log file exists
+        file:
+          path: /var/log/iptables.log
+          state: touch
+          mode: '0644'
+          owner: root
+          group: adm
+
+      - name: Create iptables logging configuration
+        copy:
+          dest: /etc/rsyslog.d/iptables.conf
+          content: |
+            :msg, contains, "IPTables-Input: " /var/log/iptables.log
+            & stop
+
+      - name: Restart rsyslog service
+        service:
+          name: rsyslog
+          state: restarted
+
+    - name: Install and Configure PostgreSQL 16
+      block:
+        - name: Create directory for PostgreSQL common
+          file:
+            path: /usr/share/postgresql-common/pgdg
+            state: directory
+
+        - name: Download PostgreSQL repository signing key
+          get_url:
+            url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+            dest: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+            mode: '0644'
+            force: yes
+
+        - name: Create the repository configuration file
+          shell: echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bullseye-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+          args:
+            executable: /bin/bash
+
+        - name: Update the package lists
+          apt:
+            update_cache: yes
+
+        - name: Install PostgreSQL-16
+          apt:
+            name: postgresql-16
+            state: present
+
+        - name: Ensure PostgreSQL is started and enabled
+          service:
+            name: postgresql
+            state: started
+            enabled: yes
+
+        - name: Configure PostgreSQL to listen on all IP addresses
+          lineinfile:
+            path: /etc/postgresql/16/main/postgresql.conf
+            regexp: "^#?listen_addresses"
+            line: "listen_addresses = '{{ db_host }}'"
+            state: present
+
+        - name: Set PostgreSQL logging to /var/log/postgresql/postgresql-16-main.log
+          lineinfile:
+            path: /etc/postgresql/16/main/postgresql.conf
+            regexp: "^#?log_directory"
+            line: "log_directory = '/var/log/postgresql'"
+            state: present
+
+        - name: Change PostgreSQL port
+          lineinfile:
+            path: /etc/postgresql/16/main/postgresql.conf
+            regexp: "^#?port"
+            line: "port = {{ db_port }}"
+            state: present
+
+        - name: Add client authentication configuration for remote access
+          lineinfile:
+            path: /etc/postgresql/16/main/pg_hba.conf
+            line: "host all all 0.0.0.0/0 md5"
+            create: yes
+
+        - name: Restart PostgreSQL to apply changes
+          service:
+            name: postgresql
+            state: restarted
+
+        - name: Set password for PostgreSQL user
+          shell: |
+            sudo -u postgres psql -c "ALTER USER {{ db_user }} WITH PASSWORD '{{ db_passwd }}';"
+
+        - name: Restart PostgreSQL to apply changes
+          service:
+            name: postgresql
+            state: restarted
+
+    - name: Reboot the server
+      ansible.builtin.shell: "reboot"
+      async: 1
+      poll: 0

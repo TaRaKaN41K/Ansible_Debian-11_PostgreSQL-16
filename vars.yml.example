@@ -1,0 +1,27 @@
+# Static IP address of the machine
+static_address: static_address
+
+# Gateway IP address
+gateway: gateway
+
+# DNS servers list
+dns_servers:
+  - dns_server
+  - dns_server
+  - dns_server
+  - dns_server
+
+# Administrator user and password
+admin_user: example_user
+admin_password: "{{ 'password' | password_hash('sha512') }}"
+
+# SSH configuration
+ssh_port: ssh_port
+ssh_listen_address: ssh_listen_address
+ssh_key_passphrase: "passphrase"
+
+# Database configuration
+db_host: db_host
+db_port: db_port
+db_user: db_user
+db_passwd: db_password
